@@ -1,0 +1,236 @@
+---
+title: "obspair_transform_example"
+author: "Rob Cooke"
+date: "02/09/2021"
+output: html_notebook
+---
+
+## Set-up ##
+
+Here we load the necessary packages
+
+```{r echo = TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(nnls)
+library(raster)
+library(gdm)
+
+# commit packages to renv library
+# renv::snapshot()
+# renv::status()
+
+# load supporting functions
+source('BILBI/BILBI_supportingFunctions.R')
+
+```
+
+#### BILBI example ####
+
+Load data
+
+```{r}
+
+## Load supporting data. This will load a `data.frame` called `Mod_data` into the session. 
+## This data.frame contains the random draw of species matches and mismatches, and associated environmental 
+## covariates for each site/pixel that the pair of species was drawn
+
+# load simplified data
+mod_data <- readRDS("BILBI/mod_data.rds")
+
+## Inspect data
+head(mod_data)
+## Interpretation:
+## Match: binary. Was the pair of species a match or mismatch?  
+## Lon1, Lat1, Lon2, Lat2: Numeric. The geographic coordinates for each site.
+## EAAS, PTA... SILT: Numeric. Environmental variables. 
+##     For descriptions of the environmental variables refer to Table S2 in the supporting documents of the 
+##     associated manuscript (Hoskins et al. 2020 accepted - see prepring version: 
+##     https://www.biorxiv.org/content/10.1101/309377v3.supplementary-material)).
+## Richness.S1, Richness.S2: integer. The number of unique species found at each site. 
+##     While true richness at each site is unknown, a filtered version of this is used as 'best-available' 
+##     when assessing model fit.
+## SORENSON: numeric. Dissimilarity calculated as Bray-Curtis dissimilarity between sites. 
+##     As with the richness calculations, this is not observed but are 'best-available' estimates, and used only to show model fit in these examples.
+## TARGET: logical. TRUE == site pair from within the target bio-realm, 
+##     FALSE == site pair from outside the target bio realm. 
+##     See S1.3 and main text of Hoskins et al. 2020 for more detail.
+
+```
+
+Model fitting
+
+```{r}
+
+## Observation pair GDM
+## The observation pair GDM follows a standard GDM (https://cran.r-project.org/web/packages/gdm/index.html) 
+## by using monotonic regression splines to describe the non-linear responses of ecological communities to 
+## environmental variation. Due to the spatially nested design of the analytical approach, 
+## with target biorealms sourrounded by neighbouring buffering regions, we fit models using either 
+## 3, 4 or 5 splines to each modelling domain.
+## 3 splines are used when all environmental envelope is covered within the target modelling domain.
+## 4 splines are used when the environmental envelope exceeds the range of the modelling domain in one direction
+## 5 splines are used when the environmental envelope exceeds the range of the modelling domain in both directions
+
+## Fold data from both sites into single vectors representing the full range of observed environmental values
+## Note: bare ground is a binary value, and as such it is not included in the splining process
+p1 <- mod_data[,6:19]
+p2 <- mod_data[,20:33]
+colnames(p2) <- colnames(p1)
+preds <- rbind(p1, p2)
+
+## Extract environmental values from target modelling domain and buffering regions
+targetPreds <- preds[mod_data$TARGET,]
+bufferPreds <- preds[!mod_data$TARGET,]
+
+## Calculate quantiles for each spline  
+q1 <- unlist(lapply(1:ncol(preds),function(x){min(bufferPreds[,x])}))
+q5 <- unlist(lapply(1:ncol(preds),function(x){max(bufferPreds[,x])}))
+q2 <- unlist(lapply(1:ncol(preds),function(x){min(targetPreds[,x])}))
+q4 <- unlist(lapply(1:ncol(preds),function(x){max(targetPreds[,x])}))
+q3 <- unlist(lapply(1:ncol(preds),function(x){quantile(targetPreds[,x],0.5)}))
+
+## Logical tests: do target and buffering quantiles match? 
+test1 <- q1 < q2
+test5 <- q4 < q5
+
+## Using the logical tests, create vectors indicating the number of splines used (3, 4 or 5) per environmental variable,
+## and the position of each spline.
+quans <- c()
+spl <- c()
+for(i in 1:length(q1)){
+    if(test1[i] & test5[i]){q <- c(q1[i],q2[i],q3[i],q4[i],q5[i]);s <- 5}
+	if(!test1[i] & !test5[i]){q <- c(q1[i],q3[i],q5[i]);s <- 3}
+	if(test1[i] & !test5[i]){q <- c(q1[i],q2[i],q3[i],q5[i]);s <- 4}
+	if(!test1[i] & test5[i]){q <- c(q1[i],q3[i],q4[i],q5[i]);s <- 4}
+	if(any(duplicated(q))){q <- q[!duplicated(q)]; s <- length(q)}
+	quans <- c(quans,q)
+	spl <- c(spl,s)
+	}
+
+## Clean up redundant objects
+rm(list = c("p1", "p2", "preds", "q1", "q2", "q3", "q4", "q5"))
+
+## Now that we know the position of each spline, it's time to transform the environmnetal data using the monotonic
+## regression splines fitted at the positions calculated in the previous steps. This step uses the supporting function 
+## splineData.
+## splineData function takes three arguements:
+## * data - data.frame or matrix. contains the data to be splined
+## * splines - vector - the number of splines top be fitted to each variable
+## * quantiles - vector - the position of each spline
+
+## Create data.frame containing only the environmental variables
+toSpline <-  mod_data[,c(6:19, 20:33)]
+
+## Spline data
+splinedData <- splineData(toSpline, splines = spl, quantiles = quans)
+
+# ## Check outputs
+# head(splinedData)
+
+## Prepare data for model fitting
+## Data structure consists of the binary response variable and all environmental
+## predictor variables. All predictors are splined with the exception of bare ground
+data <- as.data.frame(cbind(Match = mod_data$Match, splinedData))
+
+## create formula to pass to model fitting function
+f1 <- paste(colnames(data)[-1], collapse = "+")
+f1_formula <- as.formula(paste(colnames(data)[1], "~", f1, sep = ""))
+f1_formula
+
+## Fit model: stage 1
+## Stage 1 identified coefficients for all splined environmental variables within the model.
+## Model fitting uses a logit link and binomial error distribution
+## following traditional GDM analyses: positive coefficients are forced for all predictor
+## variables. The exception in an observation pair GDM is that the intercept is allowed
+## to be negative, allowing for the model to fit in logit space which ranges both positive
+## and negative rather, than the traditional negative exponential link function which only allows positive.
+
+fit_1 <- glm(formula = f1_formula, data = data, family = binomial(), control = list(maxit = 500), method = 'nnnpls.fit')
+
+## inspect model
+summary(fit_1)
+## Note: because the form of the model only allows positive coefficients - ensuring a positive
+## relationship between ecological distance and environmental distance - there will be no
+## negative coefficients and where a positive relationship was not found, the returned
+## coefficient will be zero.
+
+## extract coefficients
+coefs_1 <- coefficients(fit_1)
+
+## Fit model: stage 2
+## Stage 2 fits the relationship between geographic distance and the residual unexplained
+## variation from the stage 1 fitting procedure. In this case, a linear function is fitted;
+## however non-linear functions could also be used during this stage.
+
+## Calculate distance between the species observations in each observation pair.
+#dist <- SDMTools::distance(mod_data$Lat1,mod_data$Lon1,mod_data$Lat2,mod_data$Lon2)
+dist <- geosphere::distVincentyEllipsoid(cbind(mod_data$Lon1, mod_data$Lat1), cbind(mod_data$Lon2, mod_data$Lat2))
+## Get the linear predictor from the stage 1 model fitting
+eco.intRemM <- fit_1$linear.predictors
+## Setup data
+dataTab <- data.frame(Match = fit_1$y, Ecological = eco.intRemM, Distance = dist / 1000)
+## Fit model - linear predictor from stage 1 is used as an offset in the fitting of stage 2
+## ensuring that the model can only interact with the residual variation from stage 1
+fit_2 <- glm(Match ~ offset(Ecological) + Distance, family = binomial(), data = dataTab, control = list(maxit = 1000), method = 'nnls.fit')
+
+## Inspect model
+summary(fit_2)
+
+## Extract coefficients
+coefs_2 <- coefficients(fit_2)
+
+```
+
+# transform
+
+```{r}
+
+# number of variables
+nvar <- ncol(toSpline) / 2
+
+## find the position of each coefficient 
+pos <- c(0, cumsum(spl))
+
+# compile coefficients and knots for predictors
+coefs_knots <- lapply(1:nvar, function(n) {
+  
+  nSplines <- spl[n]
+  pCoeffs <- coefs_1[(pos[n]+2):(pos[n+1]+1)]
+  pQuants <- quans[(pos[n]+1):pos[n+1]]
+  
+  out <- data.frame(coefs = pCoeffs, knots = pQuants)
+}) %>% 
+  dplyr::bind_rows()
+
+# coefficients and knots for geographic distance
+geo_df <- data.frame(coefs = c(0, coefs_2[2]), knots = c(min(dataTab$Distance), max(dataTab$Distance)), row.names = c("Geographic_spl1", "Geographic_spl2"))
+
+# combine geographic coefficients and predictor coefficients
+coefs_knots <- dplyr::bind_rows(geo_df, coefs_knots)
+
+gdmModOb <- structure(list(dataname = as.name("mod_data"),
+                           geo = TRUE,
+                           sample = nrow(mod_data),
+                           gdmdeviance = fit_2$deviance, # residual deviance after second model
+                           nulldeviance = fit_1$null.deviance, # null deviance from first model
+                           explained = ((fit_1$null.deviance - fit_2$deviance) / fit_1$null.deviance) * 100, # variance explained by the combination of both models
+                           intercept = coefs_1[1] + coefs_2[1],
+                           predictors = c("Geographic", colnames(mod_data[,6:19])),
+                           coefficients = coefs_knots$coefs,
+                           knots = coefs_knots$knots,
+                           splines = c(2, spl),
+                           creationdate = date(),
+                           observed = fit_2$y, # Observed proportion of species mismatch
+                           predicted = fitted(fit_2), # Predicted proportion of species mismatch
+                           ecological = fit_2$linear.predictor)) # Predicted Ecological Distance
+
+##sets gdm object class  
+class(gdmModOb) <- c("gdm", "list")
+
+gdmtrans <- gdm::gdm.transform(gdmModOb, mod_data[,c(2:3,6:19)])
+
+head(gdmtrans)
+
+```
